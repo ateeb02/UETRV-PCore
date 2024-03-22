@@ -85,19 +85,88 @@ assign pc_misaligned = pc_ff[1] | pc_ff[0];
 // Stall signal for IF stage
 assign if_stall = fwd2if.if_stall | (~icache2if.ack) | irq_req_next;
 
-// PC update state machine
+////////////////////////////////////////////////
+
+logic   [15:0]           upper_half_q, upper_half_d, if2cd_r_data;
+logic   [`XLEN-1:0]      cd2if_r_data, instr_word;
+logic                    is_cmp;
+
+logic   [`XLEN-1:0]      pc_icache_next, pc_icache_ff;
+
+assign is_cmp = (&icache2if.r_data[1:0]) ? 1'b0 : 1'b1;
+
+assign upper_half_d = icache2if.ack ? icache2if.r_data[31:16] : upper_half_d;
+assign if2cd_r_data = icache2if.r_data[15:0];
+
+assign pc_next = pc_ff + pc_incr;
+
+assign fb_misalign = (fwd2if.csr_new_pc_req & csr2if_fb.pc_new[1]) | (fwd2if.wfi_req & csr2if_fb.pc_new[1]) | (fwd2if.exe_new_pc_req  & exe2if_fb.pc_new[1]);
+
 always_ff @(posedge clk) begin
     if (~rst_n) begin
         pc_ff <= `PC_RESET;
+        pc_icache_ff <= `PC_RESET;
+
+        upper_half_q <= '0;
+        br_stall_q <= 1'b0;
     end else begin
         pc_ff <= pc_next;
+        pc_icache_ff <= pc_icache_next;
+
+        upper_half_q <= upper_half_d;
+        br_stall_q <= br_stall_d;
     end
 end
 
-assign pc_plus_4 = pc_ff + 32'd4;
+always_comb begin 
+    if (fb_misalign & (~br_stall_q)) begin
+        pc_icache_next = pc_next - 2'd2;
+        br_stall_d = 1'b1;
+    end else if (br_stall_q) begin
+        pc_icache_next = pc_icache_ff + 3'd4; //if doesnt work try pc_icache_ff + 4
+        br_stall_d = 1'b0;
+    end else if (pc_next[1]) begin
+        pc_icache_next = pc_next + 3'd2;
+        br_stall_d = 1'b0;
+    end else begin
+        pc_icache_next = pc_next;
+        br_stall_d = 1'b0;
+    end
+end
 
 always_comb begin
-    pc_next = (pc_plus_4);
+    case ({pc_ff[1], is_cmp})
+        2'b00: begin        //Aligned Uncompressed
+            pc_incr = 3'd4;
+            instr_word = icache2if.r_data;
+        end                 
+        2'b01: begin        //Aligned Compressed
+            pc_incr = 3'd2;
+            instr_word = cd2if_r_data;
+        end
+        2'b10: begin        //Unaligned Uncompressed
+            pc_incr = 3'd4;
+            instr_word = {icache2if.r_data[15:0], upper_half_q};
+        end
+        2'b11: begin        //Unaligned Compressed
+            pc_incr = 3'd2;
+            instr_word = upper_half_q;
+        end
+    endcase
+end
+
+cmp_decode cmp_decode(
+    .inst16_i(if2cd_r_data),
+    .inst32_o(cd2if_r_data),
+
+    .req_i((is_cmp & mmu2if.i_hit))
+);
+
+////////////////////////////////////////////////
+
+
+always_comb begin
+    pc_next = (pc_next);
 
     case (1'b1)
         fwd2if.csr_new_pc_req : begin
